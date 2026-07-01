@@ -90,8 +90,8 @@ class VectorNorm(torch.nn.Module):
         self.eps = eps
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        mean, variance, skewness, kurtoses = batch_stats(z, self.eps)
         norm_z = self.norm_layer(z)
-        mean, variance, skewness, kurtoses = batch_stats(norm_z, self.eps)
         norm_loss = (((mean - self.l1_target) ** 2).mean() * self.l1_weight
                      + ((variance - self.l2_target) ** 2).mean() * self.l2_weight
                      + ((skewness - self.l3_target) ** 2).mean() * self.l3_weight

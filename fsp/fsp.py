@@ -7,7 +7,7 @@ from .cdf_act import build_act
 
 class FSP(nn.Module):
     def __init__(self, levels: list[int], act_name: str = 'tanh', vector_norm: str = 'none',
-                 eta: float = 1., quantize_rate: float = 0.,
+                 quantize_rate: float = 0.,
                  need_inv_act: bool = False, ):
         super().__init__()
         self.levels = nn.Buffer(torch.tensor(levels, dtype=torch.int32), persistent=False)
@@ -23,7 +23,6 @@ class FSP(nn.Module):
         self.act_func, self.inv_act_func = build_act(self.act_name)
         self.need_inv_act = need_inv_act
 
-        self.eta = eta
         self.quantize_rate = quantize_rate
 
     def __repr__(self):
@@ -32,7 +31,6 @@ class FSP(nn.Module):
                 f"codebook_size={self.codebook_size}, "
                 f"act_name={self.act_name}, "
                 f"need_inv_act={self.need_inv_act}, "
-                f"eta={self.eta}, "
                 f"quantize_rate={self.quantize_rate}, "
                 f")")
 
@@ -54,7 +52,7 @@ class FSP(nn.Module):
     def forward(self, features: torch.Tensor, eps: float = None) -> tuple[torch.Tensor, torch.Tensor, dict]:
         eps = eps or torch.finfo(features.dtype).eps
         feature_shape = features.shape
-        z = features.view(-1, feature_shape[-1])
+        z = features.reshape(-1, feature_shape[-1])
         z, norm_loss, norm_info = self.vector_norm(z)
 
         act_z = self.act_func(z)
@@ -63,7 +61,7 @@ class FSP(nn.Module):
 
         quantize_rate = self.quantize_rate if self.training else 1.0
         if quantize_rate < 1.:
-            p_max_norm = self.eta / (self.levels * 2)
+            p_max_norm = 1.0 / (self.levels * 2)
             perturbations = p_max_norm * (torch.rand_like(act_z) * 2 - 1)
             proposal = act_z + perturbations
             accept_mask = (proposal > 0.0) & (proposal < 1.0)
@@ -100,5 +98,11 @@ class FSP(nn.Module):
         level_indices = self.indices_to_level_indices(indices)
         return (level_indices + 0.5) / self.levels
 
-    def indices_to_codes(self, indices: torch.Tensor):
-        return self.inv_act_func(self.indices_to_act_value(indices))
+    def indices_to_codes(self, indices: torch.Tensor, eps: float = 1e-6):
+        q_act_z = self.indices_to_act_value(indices)
+        if self.need_inv_act:
+            q_z = self.inv_act_func(q_act_z.clamp(eps, 1 - eps))
+        else:
+            # q_z = q_act_z * 2 - 1
+            q_z = (q_act_z - 0.5) / 0.28867513459481287
+        return q_z

@@ -34,7 +34,24 @@ class VectorPerturbation(nn.Module):
         self._compiled = True
         self.codebook = torch.nn.Buffer(torch.randn(codebook_size, self.codebook_dim,
                                                     dtype=torch.float32, requires_grad=False))
+        self.codebook_2 = torch.nn.Buffer((self.codebook ** 2).sum(dim=1)[None, :])
         self.keep_eval = False
+
+    def estimate_eta(self, estimate_times: int = 20):
+        self._compiled = False
+        eta_diffs = []
+        for _ in range(estimate_times):
+            latents = torch.randn(1024, self.codebook_dim, dtype=self.codebook.dtype, device=self.codebook.device)
+            self.eval()
+            q_latents, *_ = self(latents, update_probability=0.0, )
+            self.train()
+            p_latents, *_ = self(latents, update_probability=0.0, )
+            perturbation_scale = (p_latents - latents).square().sum(dim=-1).sqrt()
+            quantization_scale = (q_latents - latents).square().sum(dim=-1).sqrt()
+            mask = (perturbation_scale > 1e-6)
+            eta_diff = quantization_scale[mask].mean() / perturbation_scale[mask].mean()
+            eta_diffs.append(eta_diff.item())
+        return sum(eta_diffs) / len(eta_diffs)
 
     def __repr__(self):
         return (f"VectorPerturbation("
@@ -55,13 +72,37 @@ class VectorPerturbation(nn.Module):
         super().train(mode=mode)
         if (not mode) and (not self._compiled):
             self.codebook.copy_(self.codebook_compiler.fit(self.samples_queue.samples))
+            self.codebook_2.copy_((self.codebook ** 2).sum(dim=1)[None, :])
             self._compiled = True
         return self
 
     def quantize(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        distances = torch.cdist(z, self.codebook, p=2)
-        min_dis, min_ind = torch.min(distances, dim=1)
-        return self.codebook[min_ind], min_ind, min_dis
+        z2 = (z ** 2).sum(dim=1, keepdim=True)  # [N, 1]
+        dist2 = z2 + self.codebook_2 - 2 * z @ self.codebook.t()  # [N, K]
+        min_sse, min_ind = dist2.min(dim=1)
+        return self.codebook[min_ind], min_ind, min_sse
+
+    def get_perturbations(self, z: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            perturbations: torch.Tensor
+            perturbation_mask: torch.Tensor
+            perturbation_scale: torch.Tensor
+        """
+        d_z = self.samples_queue.min_k_norm(z, k=self.sample_num_per_cluster, chunk_size=self.chunk_size)
+        p_max_norm = self.eta * d_z[:, -1]
+        perturbations, p_rad = v_utils.sample_unit_ball_uniform(
+            dim=self.codebook_dim, num_samples=z.shape[0],
+            device=z.device, dtype=z.dtype, eps=eps, return_radius=True)
+        perturbations, p_rad = p_max_norm[:, None] * perturbations, p_max_norm * p_rad
+        p_z = z + perturbations
+        d_pz = self.samples_queue.min_k_norm(p_z, k=self.sample_num_per_cluster, chunk_size=self.chunk_size)
+        dk_pz = d_pz[:, self.k4nn - 1]
+        dk_z = d_z[:, self.k4nn - 1]
+        log_accept_ratio = self.codebook_dim * (dk_z.log() + d_z[:, -1].log() - dk_pz.log() - d_pz[:, -1].log())
+        accept_mask = (torch.rand_like(log_accept_ratio).clamp_min(eps).log() < log_accept_ratio)
+        accept_mask &= (p_rad < self.eta * d_pz[:, -1])
+        return perturbations, accept_mask, p_rad
 
     def forward(self, features: torch.Tensor,
                 update_probability: float = 1e-2,
@@ -80,37 +121,25 @@ class VectorPerturbation(nn.Module):
             others: dict
         """
         feature_shape = features.shape
-        z = features.view(-1, feature_shape[-1])
+        z = features.reshape(-1, feature_shape[-1])
         z, norm_loss, norm_info = self.vector_norm(z)
 
         with torch.no_grad():
             if self.keep_eval or (not self.training):
-                q_z, indices, distances = self.quantize(z)
+                q_z, indices, quantize_sse = self.quantize(z)
+                z_bias = (q_z - z).detach()
                 other_info = {
-                    'quantize_mean_distances': distances.mean(),
-                    'quantize_mean_sse': distances.square().mean(),
+                    'quantize_mean_sse': quantize_sse.mean(),
                 }
             else:
-                d_z = self.samples_queue.min_k_norm(z, k=self.sample_num_per_cluster, chunk_size=self.chunk_size)
-                p_max_norm = self.eta * d_z[:, -1]
-                perturbations, p_rad = v_utils.sample_unit_ball_uniform(
-                    dim=self.codebook_dim, num_samples=z.shape[0],
-                    device=z.device, dtype=z.dtype, eps=eps, return_radius=True)
-                perturbations, p_rad = p_max_norm[:, None] * perturbations, p_max_norm * p_rad
-                p_z = z + perturbations
-                d_pz = self.samples_queue.min_k_norm(p_z, k=self.sample_num_per_cluster, chunk_size=self.chunk_size)
-                dk_pz = d_pz[:, self.k4nn - 1]
-                dk_z = d_z[:, self.k4nn - 1]
-                log_accept_ratio = self.codebook_dim * (dk_z.log() + d_z[:, -1].log() - dk_pz.log() - d_pz[:, -1].log())
-                accept_mask = (torch.rand_like(log_accept_ratio).clamp_min(eps).log() < log_accept_ratio)
-                accept_mask &= (p_rad < self.eta * d_pz[:, -1])
-                q_z = torch.where(accept_mask[:, None], p_z, z)
+                perturbations, accept_mask, p_scale = self.get_perturbations(z, eps=eps)
+                z_bias = (perturbations * accept_mask[:, None].to(dtype=perturbations.dtype)).detach()
                 indices = torch.zeros(z.shape[0], device=z.device, dtype=torch.int64)
                 other_info = {"p_accept_prob": accept_mask.float().mean()}
 
                 self.update_samples_queue(z, update_probability=update_probability)
 
-        q_z = z + (q_z - z).detach()
+        q_z = z + z_bias
         q_features = q_z.view(*feature_shape)
         indices = indices.view(*feature_shape[:-1])
         return q_features, indices, {

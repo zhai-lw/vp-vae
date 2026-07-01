@@ -126,28 +126,32 @@ class SamplesKMeans:
 
         return assignments
 
-    def _update_centroids(self, cluster_sums: torch.Tensor, cluster_counts: torch.Tensor):
+    @staticmethod
+    def _update_centroids(cluster_sums: torch.Tensor, cluster_counts: torch.Tensor):
         nonempty_mask = cluster_counts > 0
-        self.centroids[nonempty_mask] = cluster_sums[nonempty_mask] / cluster_counts[nonempty_mask, None]
+        new_centroids = torch.zeros_like(cluster_sums)
+        new_centroids[nonempty_mask] = cluster_sums[nonempty_mask] / cluster_counts[nonempty_mask, None]
         empty_idx = torch.nonzero(~nonempty_mask, as_tuple=True)[0]
         n_empty = empty_idx.size(0)
         if n_empty != 0 and ddp.is_process_zero():
             log.debug(f"Found {n_empty} empty clusters. Performing splitting strategy.")
             _, candidate_idx = torch.topk(cluster_counts, k=n_empty, largest=True, sorted=True)
-            largest_centroids = self.centroids[candidate_idx]
-            noise_scale = torch.finfo(self.centroids.dtype).resolution
+            largest_centroids = new_centroids[candidate_idx]
+            noise_scale = torch.finfo(new_centroids.dtype).resolution
             noise = torch.randn_like(largest_centroids) * noise_scale
-            self.centroids[empty_idx] = largest_centroids + noise
-            self.centroids[candidate_idx] = largest_centroids - noise
+            new_centroids[empty_idx] = largest_centroids + noise
+            new_centroids[candidate_idx] = largest_centroids - noise
 
-        ddp.broadcast(self.centroids, src=0)
+        ddp.broadcast(new_centroids, src=0)
+        return new_centroids
 
     @torch.no_grad()
-    def fit(self, local_data: torch.Tensor, reinit_centroids: bool = True) -> torch.Tensor:
+    def fit(self, local_data: torch.Tensor, reinit_centroids: bool = True, prefix_centroids:int=0) -> torch.Tensor:
         if ddp.is_process_zero():
             log.info(f"Starting KMeans with {self.n_clusters} clusters")
         # local_data = local_data.float()
         if (self.centroids is None) or reinit_centroids:
+            assert prefix_centroids == 0
             self._initialize_centroids(local_data)
 
         for i in range(self.max_iter):
@@ -162,7 +166,8 @@ class SamplesKMeans:
             local_sums.index_add_(0, assignments, local_data)
             ddp.all_reduce(local_sums, ddp.ReduceOp.SUM)
 
-            self._update_centroids(local_sums, local_counts)
+            self.centroids[prefix_centroids:] = (
+                self._update_centroids(local_sums[prefix_centroids:], local_counts[prefix_centroids:]))
 
             # Check Convergence
             center_shift = torch.norm(self.centroids - old_centroids, p='fro')

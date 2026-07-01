@@ -8,12 +8,15 @@ from torch.distributed import ReduceOp
 
 @lru_cache
 def get_world_size():
-    return distributed.get_world_size()
+    if is_distributed():
+        return distributed.get_world_size()
+    else:
+        return 1
 
 
 @lru_cache
 def is_distributed():
-    return distributed.is_initialized() and get_world_size() > 1
+    return distributed.is_initialized() and distributed.get_world_size() > 1
 
 
 @lru_cache
